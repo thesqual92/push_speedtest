@@ -57,3 +57,13 @@ Install the other dependencies with:
 ```bash
 sudo apt update
 sudo apt install -y curl jq iproute2 iputils-ping python3 iw
+```
+
+
+#Configuration
+
+The script expects an isp.cfg file in the same directory as push_speedtest.sh.
+
+Example:
+# DETECTED_SSID=Livebox-XXX
+Livebox-XXX=FQDN=192.168.1.10
