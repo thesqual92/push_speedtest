@@ -535,10 +535,10 @@ send() {
 	escape_influx_tag() {
 		local VALUE="$1"
 		VALUE="${VALUE//\\/\\\\}"
-		VALUE="${VALUE// /\\ }"
 		VALUE="${VALUE//,/\\,}"
+		VALUE="${VALUE// /\\ }"
 		VALUE="${VALUE//=/\\=}"
-		echo "$VALUE"
+		printf '%s' "$VALUE"
 	}
 	local HOSTNAME_ESCAPED
 	local BOX_ESCAPED
