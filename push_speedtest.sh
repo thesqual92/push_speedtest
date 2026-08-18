@@ -531,8 +531,22 @@ send() {
 
     local LINE
 
-    LINE="speedtest,host=${HOSTNAME},box=${BOX},interface=${BOX} ping=${PING},download=${DL},upload=${UL} ${TS}"
+    #LINE="speedtest,host=${HOSTNAME},box=${BOX},interface=${BOX} ping=${PING},download=${DL},upload=${UL} ${TS}"
+	escape_influx_tag() {
+		local VALUE="$1"
+		VALUE="${VALUE//\\/\\\\}"
+		VALUE="${VALUE// /\\ }"
+		VALUE="${VALUE//,/\\,}"
+		VALUE="${VALUE//=/\\=}"
+		echo "$VALUE"
+	}
+	local HOSTNAME_ESCAPED
+	local BOX_ESCAPED
 
+	HOSTNAME_ESCAPED=$(escape_influx_tag "$HOSTNAME")
+	BOX_ESCAPED=$(escape_influx_tag "$BOX")
+
+local LINE="speedtest,host=${HOSTNAME_ESCAPED},box=${BOX_ESCAPED},interface=${BOX_ESCAPED} ping=${PING},download=${DL},upload=${UL} ${TS}"
     echo "📤 Sending: $LINE"
 
     curl_influx "$LINE"
