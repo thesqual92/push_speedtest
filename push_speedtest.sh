@@ -10,7 +10,19 @@
 
 set -o pipefail
 
-# --- Script directory / ISP configuration ---
+# =========================================================
+# Start datetime / execution timer
+# =========================================================
+
+START_DATETIME=$(date '+%Y-%m-%d %H:%M:%S')
+START_TS=$(date +%s)
+
+echo "🕐 Start: $START_DATETIME"
+
+# =========================================================
+# Script directory / ISP configuration
+# =========================================================
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISP_CFG="${SCRIPT_DIR}/isp.cfg"
 
@@ -72,7 +84,7 @@ detect_speedtest() {
     fi
 
     # -----------------------------------------------------
-    # ARM64 / Ookla
+    # ARM64 / Ookla speedtest
     # -----------------------------------------------------
 
     if [[ "$ARCH" == "arm64" ]]; then
@@ -86,10 +98,34 @@ detect_speedtest() {
             return 0
         fi
 
-        echo "❌ FATAL: Ookla speedtest is not installed on ARM64."
-        echo "   The script will NOT add the obsolete packagecloud repository."
+        echo "📦 Installing Ookla speedtest CLI..."
 
-        return 1
+        sudo apt update || {
+            echo "❌ FATAL: apt update failed"
+            return 1
+        }
+
+        curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh |
+            sudo bash || {
+                echo "❌ FATAL: Failed to configure Ookla speedtest repository"
+                return 1
+            }
+
+        sudo apt install -y speedtest || {
+            echo "❌ FATAL: Unable to install Ookla speedtest"
+            return 1
+        }
+
+        if ! command -v speedtest >/dev/null 2>&1; then
+            echo "❌ FATAL: Ookla speedtest installation failed"
+            return 1
+        fi
+
+        SPEEDTEST_TYPE="ookla"
+
+        echo "✅ Ookla speedtest installed: $(command -v speedtest)"
+
+        return 0
     fi
 
     # -----------------------------------------------------
@@ -138,27 +174,6 @@ detect_wifi_ssid() {
     fi
 
     return 1
-}
-
-# =========================================================
-# Detect public IP
-# =========================================================
-
-detect_public_ip() {
-
-    local PUBLIC_IP
-
-    PUBLIC_IP=$(curl -4 -s \
-        --connect-timeout 5 \
-        --max-time 10 \
-        https://api.ipify.org)
-
-    if [[ -z "$PUBLIC_IP" ]]; then
-        echo "❌ Unable to detect public IPv4 address" >&2
-        return 1
-    fi
-
-    echo "$PUBLIC_IP"
 }
 
 # =========================================================
@@ -238,6 +253,7 @@ detect_box() {
 
                 echo "   🌐 $FQDN → $RESOLVED_IP" >&2
 
+                # Public IP match
                 if [[ "$RESOLVED_IP" == "$PUBLIC_IP" ]]; then
 
                     echo "   ✅ Cached SSID confirmed by public IP" >&2
@@ -246,6 +262,7 @@ detect_box() {
                     return 0
                 fi
 
+                # Exact local IP match
                 if [[ "$RESOLVED_IP" == "$LOCAL_CFG_IP" ]] &&
                    printf '%s\n' "$LOCAL_IPS" | grep -Fxq "$LOCAL_CFG_IP"; then
 
@@ -290,6 +307,7 @@ detect_box() {
 
         echo "   🌐 $FQDN → $RESOLVED_IP" >&2
 
+        # Public IP match
         if [[ "$RESOLVED_IP" == "$PUBLIC_IP" ]]; then
 
             echo "   ✅ Public IP match: $PUBLIC_IP" >&2
@@ -302,6 +320,7 @@ detect_box() {
             return 0
         fi
 
+        # Exact local IP match
         if [[ "$RESOLVED_IP" == "$LOCAL_CFG_IP" ]]; then
 
             if printf '%s\n' "$LOCAL_IPS" | grep -Fxq "$LOCAL_CFG_IP"; then
@@ -411,9 +430,34 @@ send() {
         return 1
     }
 
+    # -----------------------------------------------------
+    # Get public IP directly from Speedtest JSON
+    # -----------------------------------------------------
+
     local PUBLIC_IP
 
-    PUBLIC_IP=$(detect_public_ip) || return 1
+    if [[ "$SPEEDTEST_TYPE" == "speedtest-cli" ]]; then
+
+        PUBLIC_IP=$(echo "$JSON" |
+            jq -r '.client.ip // empty')
+
+    elif [[ "$SPEEDTEST_TYPE" == "ookla" ]]; then
+
+        PUBLIC_IP=$(echo "$JSON" |
+            jq -r '.interface.externalIp // empty')
+
+    else
+
+        echo "❌ Unknown Speedtest type: $SPEEDTEST_TYPE"
+        return 1
+    fi
+
+    if [[ -z "$PUBLIC_IP" ]]; then
+
+        echo "❌ Unable to detect public IPv4 address from Speedtest JSON"
+
+        return 1
+    fi
 
     local BOX
 
@@ -430,7 +474,9 @@ send() {
         BOX=$(detect_box "$PUBLIC_IP")
 
         if [[ $? -ne 0 || -z "$BOX" ]]; then
+
             echo "❌ No SSID found - speedtest result will NOT be sent"
+
             return 1
         fi
     fi
@@ -439,7 +485,7 @@ send() {
     echo "📶 SSID: $BOX"
 
     # -----------------------------------------------------
-    # Parse JSON
+    # Parse Speedtest values
     # -----------------------------------------------------
 
     local PING
@@ -448,23 +494,31 @@ send() {
 
     if [[ "$SPEEDTEST_TYPE" == "ookla" ]]; then
 
-        PING=$(echo "$JSON" | jq -r '.ping.latency // 0')
-        DL=$(echo "$JSON" | jq -r '.download.bandwidth * 8 / 1000000 // 0')
-        UL=$(echo "$JSON" | jq -r '.upload.bandwidth * 8 / 1000000 // 0')
+        PING=$(echo "$JSON" |
+            jq -r '.ping.latency // 0')
+
+        DL=$(echo "$JSON" |
+            jq -r '.download.bandwidth * 8 / 1000000 // 0')
+
+        UL=$(echo "$JSON" |
+            jq -r '.upload.bandwidth * 8 / 1000000 // 0')
 
     elif [[ "$SPEEDTEST_TYPE" == "speedtest-cli" ]]; then
 
-        PING=$(echo "$JSON" | jq -r '.ping // 0')
-        DL=$(echo "$JSON" | jq -r '.download / 1000000 // 0')
-        UL=$(echo "$JSON" | jq -r '.upload / 1000000 // 0')
+        PING=$(echo "$JSON" |
+            jq -r '.ping // 0')
 
-    else
+        DL=$(echo "$JSON" |
+            jq -r '.download / 1000000 // 0')
 
-        echo "❌ Unknown Speedtest type: $SPEEDTEST_TYPE"
-        return 1
+        UL=$(echo "$JSON" |
+            jq -r '.upload / 1000000 // 0')
+
     fi
 
-    if [[ "$PING" == "null" || "$DL" == "null" || "$UL" == "null" ]]; then
+    if [[ "$PING" == "null" ||
+          "$DL" == "null" ||
+          "$UL" == "null" ]]; then
 
         echo "❌ Null values: ping=$PING dl=$DL ul=$UL"
 
@@ -500,7 +554,8 @@ if [[ "$SPEEDTEST_TYPE" == "ookla" ]]; then
 
 elif [[ "$SPEEDTEST_TYPE" == "speedtest-cli" ]]; then
 
-    LOCAL_JSON=$(speedtest-cli --json 2>/dev/null)
+    LOCAL_JSON=$(speedtest-cli \
+        --json 2>/dev/null)
 
 else
 
@@ -509,18 +564,33 @@ else
 fi
 
 if [[ -z "$LOCAL_JSON" ]]; then
+
     echo "❌ Speedtest returned no JSON output"
-    exit 1
+
+    RESULT=1
+
+else
+
+    send "$LOCAL_JSON"
+    RESULT=$?
+
 fi
 
-send "$LOCAL_JSON"
+# =========================================================
+# End datetime / execution duration
+# =========================================================
 
-RESULT=$?
+END_DATETIME=$(date '+%Y-%m-%d %H:%M:%S')
+END_TS=$(date +%s)
+DURATION=$((END_TS - START_TS))
+
+echo "🕐 End:   $END_DATETIME"
+echo "⏱️ Duration: ${DURATION}s"
 
 if [[ $RESULT -eq 0 ]]; then
-    echo "✅ Complete: $(date)"
+    echo "✅ Complete: $END_DATETIME"
 else
-    echo "❌ Failed: $(date)"
+    echo "❌ Failed: $END_DATETIME"
 fi
 
 exit $RESULT
