@@ -224,7 +224,7 @@ The script sends data using InfluxDB Line Protocol.
 Example:
 
 ```text
-speedtest,host=pizw1,box=Livebox-XXX,interface=Livebox-XXX ping=12.3,download=92.5,upload=18.7 1755510302000000000
+speedtest,host=pizero,box=Livebox-XXX,interface=Livebox-XXX ping=12.3,download=92.5,upload=18.7 1755510302000000000
 ```
 
 The fields are:
@@ -313,7 +313,7 @@ Example on a Pi Zero:
 Start: 2026-08-18 11:46:32
 Architecture: armhf
 Using Debian speedtest-cli: /usr/bin/speedtest-cli
-Speedtest from pizw1 -> influxdb
+Speedtest from pizero -> influxdb
 Speedtest type: speedtest-cli
 ...
 End:   2026-08-18 11:47:17
@@ -327,7 +327,7 @@ Example on a Pi 4B:
 Start: 2026-08-18 11:45:02
 Architecture: arm64
 Using Ookla speedtest: /usr/bin/speedtest
-Speedtest from pi4bssd -> influxdb
+Speedtest from pi4b -> influxdb
 Speedtest type: ookla
 ...
 End:   2026-08-18 11:45:35
