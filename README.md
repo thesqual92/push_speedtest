@@ -1,10 +1,15 @@
 # Push Speedtest to InfluxDB
 
-Bash script designed to run an Ookla Speedtest on Debian/Linux devices and push the results to an InfluxDB 1.x database.
+Bash script designed to run a Speedtest on Debian/Linux devices and push the results to an InfluxDB 1.x database.
 
-The script automatically detects the ISP/connection (SSID) using several methods:
+The script supports both **64-bit ARM64** and **32-bit ARMHF** Raspberry Pi systems and automatically selects the appropriate Speedtest implementation:
 
-1. Wi-Fi SSID detection
+- **ARM64** → Ookla `speedtest`
+- **ARMHF / 32-bit** → Debian `speedtest-cli`
+
+The script automatically detects the ISP/Internet connection (SSID) using several methods:
+
+1. Direct Wi-Fi SSID detection
 2. Cached SSID
 3. Public IP / FQDN matching
 4. Local device IP / FQDN matching
@@ -15,8 +20,13 @@ This allows the same script to run on multiple devices connected to different In
 
 ## Features
 
-- Automatically installs the Ookla Speedtest CLI if it is not installed.
+- Automatically detects the system architecture.
+- Supports **ARM64 and ARMHF / 32-bit** systems.
+- Automatically installs **Ookla Speedtest** on ARM64 if it is not installed.
+- Automatically installs Debian **`speedtest-cli`** on ARMHF if it is not installed.
 - Runs Speedtest in JSON format.
+- Extracts the public IPv4 address directly from the Speedtest result.
+- Does not require an external public-IP service such as `api.ipify.org`.
 - Extracts:
   - Ping latency
   - Download speed
@@ -30,42 +40,19 @@ This allows the same script to run on multiple devices connected to different In
 - Caches the last detected SSID in `isp.cfg`.
 - Automatically falls back to DNS/IP detection if the cached SSID is no longer valid.
 - Sends data to InfluxDB using the Line Protocol.
+- Records script start and end timestamps.
+- Displays total script execution duration.
 - Provides detailed diagnostic output.
 
 ---
 
-## Requirements
+## Speedtest implementations
 
-The script is designed for Debian-based systems, including Debian Trixie ARM64.
+The script automatically selects the Speedtest implementation based on the Debian architecture.
 
-Required commands:
+### ARM64
 
-- `bash`
-- `curl`
-- `jq`
-- `ip`
-- `getent`
-- `ping`
-- `python3`
-- `iw` (optional, required for direct Wi-Fi SSID detection)
-- Ookla `speedtest`
+On 64-bit systems:
 
-The script automatically installs `speedtest` if it is missing.
-
-Install the other dependencies with:
-
-```bash
-sudo apt update
-sudo apt install -y curl jq iproute2 iputils-ping python3 iw
-```
-
-
-## Configuration
-
-The script expects an isp.cfg file in the same directory as push_speedtest.sh.
-
-Example:
-```bash
-# DETECTED_SSID=Livebox-XXX
-Livebox-XXX=FQDN=192.168.1.10
-```
+```text
+arm64
