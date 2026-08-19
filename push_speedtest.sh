@@ -4,8 +4,11 @@
 # push_speedtest.sh
 # Raspberry Pi OS / Debian Trixie
 #
-# ARM64  -> Ookla speedtest
-# ARMHF  -> Debian speedtest-cli
+# ARM64 -> Ookla speedtest
+# ARMHF -> Debian speedtest-cli
+#
+# Internet must use wlan0 unless ISP.cfg explicitly
+# allows an Ethernet interface.
 # =========================================================
 
 set -o pipefail
@@ -28,6 +31,23 @@ ISP_CFG="${SCRIPT_DIR}/isp.cfg"
 
 if [[ ! -f "$ISP_CFG" ]]; then
     echo "❌ FATAL: ISP configuration file not found: $ISP_CFG"
+    exit 1
+fi
+
+# =========================================================
+# Configuration
+# =========================================================
+
+INFLUX_HOST="influxdb"
+HOSTNAME=$(hostname)
+
+PASS=$(sudo cat /etc/speedtest/influxdb_pass 2>/dev/null) || {
+    echo "❌ FATAL: Cannot read InfluxDB password"
+    exit 1
+}
+
+if [[ -z "$PASS" ]]; then
+    echo "❌ FATAL: InfluxDB password is empty"
     exit 1
 fi
 
@@ -84,7 +104,7 @@ detect_speedtest() {
     fi
 
     # -----------------------------------------------------
-    # ARM64 / Ookla speedtest
+    # ARM64 / Ookla
     # -----------------------------------------------------
 
     if [[ "$ARCH" == "arm64" ]]; then
@@ -112,7 +132,7 @@ detect_speedtest() {
             }
 
         sudo apt install -y speedtest || {
-            echo "❌ FATAL: Unable to install Ookla speedtest"
+            echo "❌ FATAL: Unable to install speedtest"
             return 1
         }
 
@@ -128,10 +148,6 @@ detect_speedtest() {
         return 0
     fi
 
-    # -----------------------------------------------------
-    # Unknown architecture
-    # -----------------------------------------------------
-
     echo "❌ FATAL: Unsupported architecture: ${ARCH:-unknown}"
 
     return 1
@@ -140,212 +156,198 @@ detect_speedtest() {
 detect_speedtest || exit 1
 
 # =========================================================
-# Configuration
+# Get Internet route
 # =========================================================
 
-INFLUX_HOST="influxdb"
+get_internet_route() {
 
-PASS=$(sudo cat /etc/speedtest/influxdb_pass) || {
-    echo "❌ FATAL: Cannot read InfluxDB password"
-    exit 1
+    local ROUTE
+
+    ROUTE=$(ip route get 1.1.1.1 2>/dev/null | head -n1)
+
+    if [[ -z "$ROUTE" ]]; then
+        echo "❌ Unable to determine Internet route" >&2
+        return 1
+    fi
+
+    echo "$ROUTE"
+
+    return 0
 }
 
-TS=$(date +%s%N)
-HOSTNAME=$(hostname)
+# =========================================================
+# Get interface used for Internet
+# =========================================================
+
+get_internet_interface() {
+
+    local ROUTE
+    local INTERFACE
+
+    ROUTE=$(get_internet_route) || return 1
+
+    INTERFACE=$(echo "$ROUTE" |
+        sed -nE 's/.* dev ([^ ]+).*/\1/p')
+
+    if [[ -z "$INTERFACE" ]]; then
+        echo "❌ Unable to determine Internet interface" >&2
+        return 1
+    fi
+
+    echo "$INTERFACE"
+
+    return 0
+}
 
 # =========================================================
-# Wi-Fi SSID detection
+# Get Internet gateway
+# =========================================================
+
+get_internet_gateway() {
+
+    local ROUTE
+    local GATEWAY
+
+    ROUTE=$(get_internet_route) || return 1
+
+    GATEWAY=$(echo "$ROUTE" |
+        sed -nE 's/.* via ([^ ]+).*/\1/p')
+
+    echo "$GATEWAY"
+
+    return 0
+}
+
+# =========================================================
+# Detect Wi-Fi SSID
 # =========================================================
 
 detect_wifi_ssid() {
 
+    local INTERFACE="${1:-wlan0}"
     local SSID
 
-    if command -v iw >/dev/null 2>&1; then
+    if ! command -v iw >/dev/null 2>&1; then
+        return 1
+    fi
 
-        SSID=$(iw dev wlan0 link 2>/dev/null |
-            awk -F': ' '/SSID:/ {print $2; exit}')
+    SSID=$(iw dev "$INTERFACE" link 2>/dev/null |
+        awk -F': ' '/SSID:/ {print $2; exit}')
 
-        if [[ -n "$SSID" ]]; then
-            echo "📶 Wi-Fi SSID detected: $SSID" >&2
-            echo "$SSID"
-            return 0
-        fi
+    if [[ -n "$SSID" ]]; then
+        echo "📶 Wi-Fi SSID detected on $INTERFACE: $SSID" >&2
+        echo "$SSID"
+        return 0
     fi
 
     return 1
 }
 
 # =========================================================
-# Cache detected SSID
+# Read configured SSIDs
+#
+# Normal format:
+#
+# SSID=FQDN=LOCAL_IP
+#
+# Example:
+#
+# Livebox-D8B0=livebox.example.net=192.168.1.1
+# iPhone P=iphone.example.net=172.20.10.1
+#
+# Optional explicit Ethernet test:
+#
+# TEST_INTERFACE=eth0
+#
+# If TEST_INTERFACE exists, an Ethernet Internet route
+# is allowed.
 # =========================================================
 
-update_cached_ssid() {
+get_configured_test_interface() {
 
-    local SSID="$1"
-    local TMP_CFG="${ISP_CFG}.tmp"
+    local VALUE
 
-    grep -vE '^[[:space:]]*#?[[:space:]]*DETECTED_SSID=' \
-        "$ISP_CFG" > "$TMP_CFG"
-
-    {
-        echo "# DETECTED_SSID=$SSID"
-        cat "$TMP_CFG"
-    } > "${TMP_CFG}.new"
-
-    mv "${TMP_CFG}.new" "$ISP_CFG"
-    rm -f "$TMP_CFG"
-
-    echo "💾 Cached SSID updated: $SSID" >&2
-}
-
-# =========================================================
-# Detect ISP / SSID from public IP
-# =========================================================
-
-detect_box() {
-
-    local PUBLIC_IP="$1"
-    local SSID FQDN LOCAL_CFG_IP RESOLVED_IP
-    local CACHED_SSID=""
-    local LOCAL_IPS
-
-    # Get all IPv4 addresses assigned to this device
-    LOCAL_IPS=$(ip -4 addr show scope global |
-        awk '/inet / {print $2}' |
-        cut -d/ -f1)
-
-    echo "🖧 Local device IPs: $(echo "$LOCAL_IPS" | tr '\n' ' ')" >&2
-
-    # -----------------------------------------------------
-    # Read cached SSID
-    # -----------------------------------------------------
-
-    CACHED_SSID=$(awk -F= '
-        /^[[:space:]]*#?[[:space:]]*DETECTED_SSID=/ {
-            sub(/^[[:space:]]*#?[[:space:]]*DETECTED_SSID=/, "", $0)
-            gsub(/[[:space:]]/, "", $0)
+    VALUE=$(awk -F= '
+        /^[[:space:]]*TEST_INTERFACE[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "", $0)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
             print $0
             exit
         }
     ' "$ISP_CFG")
 
-    if [[ -n "$CACHED_SSID" ]]; then
+    echo "$VALUE"
+}
 
-        echo "⚡ Cached SSID: $CACHED_SSID" >&2
+# =========================================================
+# Determine whether current Internet route is allowed
+# =========================================================
 
-        while IFS='=' read -r SSID FQDN LOCAL_CFG_IP; do
+check_internet_interface() {
 
-            [[ "$SSID" != "$CACHED_SSID" ]] && continue
+    local INTERFACE
+    local GATEWAY
+    local ALLOWED_ETHERNET
 
-            SSID="$(echo "$SSID" | xargs)"
-            FQDN="$(echo "$FQDN" | xargs)"
-            LOCAL_CFG_IP="$(echo "$LOCAL_CFG_IP" | xargs)"
+    INTERFACE=$(get_internet_interface) || return 1
+    GATEWAY=$(get_internet_gateway)
 
-            [[ -z "$FQDN" || -z "$LOCAL_CFG_IP" ]] && continue
+    echo "🌐 Internet interface: $INTERFACE"
+    [[ -n "$GATEWAY" ]] && echo "🚪 Internet gateway: $GATEWAY"
 
-            echo "🔎 Fast check: $SSID → $FQDN=$LOCAL_CFG_IP" >&2
+    # -----------------------------------------------------
+    # Wi-Fi is the normal/expected case
+    # -----------------------------------------------------
 
-            RESOLVED_IP=$(getent ahostsv4 "$FQDN" 2>/dev/null |
-                awk 'NR==1 {print $1}')
+    if [[ "$INTERFACE" == "wlan0" ]]; then
 
-            if [[ -n "$RESOLVED_IP" ]]; then
+        echo "✅ Internet uses wlan0"
 
-                echo "   🌐 $FQDN → $RESOLVED_IP" >&2
-
-                # Public IP match
-                if [[ "$RESOLVED_IP" == "$PUBLIC_IP" ]]; then
-
-                    echo "   ✅ Cached SSID confirmed by public IP" >&2
-                    echo "$SSID"
-
-                    return 0
-                fi
-
-                # Exact local IP match
-                if [[ "$RESOLVED_IP" == "$LOCAL_CFG_IP" ]] &&
-                   printf '%s\n' "$LOCAL_IPS" | grep -Fxq "$LOCAL_CFG_IP"; then
-
-                    echo "   ✅ Cached SSID confirmed by local IP $LOCAL_CFG_IP" >&2
-                    echo "$SSID"
-
-                    return 0
-                fi
-            fi
-
-            echo "   ⚠️ Cached SSID no longer matches" >&2
-
-        done < "$ISP_CFG"
+        return 0
     fi
 
     # -----------------------------------------------------
-    # Full detection
+    # Ethernet
     # -----------------------------------------------------
 
-    echo "🔍 Running full SSID detection..." >&2
+    ALLOWED_ETHERNET=$(get_configured_test_interface)
 
-    while IFS='=' read -r SSID FQDN LOCAL_CFG_IP; do
+    if [[ -n "$ALLOWED_ETHERNET" &&
+          "$INTERFACE" == "$ALLOWED_ETHERNET" ]]; then
 
-        [[ -z "$SSID" || "$SSID" =~ ^[[:space:]]*# ]] && continue
-        [[ "$SSID" == "DETECTED_SSID" ]] && continue
+        echo "⚠️ Internet uses $INTERFACE"
+        echo "✅ Ethernet test explicitly allowed by isp.cfg"
 
-        SSID="$(echo "$SSID" | xargs)"
-        FQDN="$(echo "$FQDN" | xargs)"
-        LOCAL_CFG_IP="$(echo "$LOCAL_CFG_IP" | xargs)"
+        return 0
+    fi
 
-        [[ -z "$SSID" || -z "$FQDN" || -z "$LOCAL_CFG_IP" ]] && continue
+    echo "🛑 Internet uses $INTERFACE"
+    echo "🛑 Wi-Fi is not being used for Internet"
+    echo "🛑 Speedtest will NOT be executed"
 
-        echo "🔎 Testing $SSID → $FQDN=$LOCAL_CFG_IP" >&2
+    return 2
+}
 
-        RESOLVED_IP=$(getent ahostsv4 "$FQDN" 2>/dev/null |
-            awk 'NR==1 {print $1}')
+# =========================================================
+# Escape InfluxDB tag value
+#
+# Escape:
+#   \  -> \\
+#   space -> \ 
+#   , -> \,
+#   = -> \=
+# =========================================================
 
-        if [[ -z "$RESOLVED_IP" ]]; then
-            echo "   ❌ Cannot resolve $FQDN" >&2
-            continue
-        fi
+escape_influx_tag() {
 
-        echo "   🌐 $FQDN → $RESOLVED_IP" >&2
+    local VALUE="$1"
 
-        # Public IP match
-        if [[ "$RESOLVED_IP" == "$PUBLIC_IP" ]]; then
+    VALUE="${VALUE//\\/\\\\}"
+    VALUE="${VALUE// /\\ }"
+    VALUE="${VALUE//,/\\,}"
+    VALUE="${VALUE//=/\\=}"
 
-            echo "   ✅ Public IP match: $PUBLIC_IP" >&2
-
-            update_cached_ssid "$SSID"
-
-            echo "📶 SSID found: $SSID" >&2
-            echo "$SSID"
-
-            return 0
-        fi
-
-        # Exact local IP match
-        if [[ "$RESOLVED_IP" == "$LOCAL_CFG_IP" ]]; then
-
-            if printf '%s\n' "$LOCAL_IPS" | grep -Fxq "$LOCAL_CFG_IP"; then
-
-                echo "   ✅ Exact local IP match: $LOCAL_CFG_IP" >&2
-
-                update_cached_ssid "$SSID"
-
-                echo "📶 SSID found: $SSID" >&2
-                echo "$SSID"
-
-                return 0
-            fi
-
-            echo "   ⚠️ $LOCAL_CFG_IP is not assigned to this device" >&2
-            continue
-        fi
-
-        echo "   ❌ No match for $SSID" >&2
-
-    done < "$ISP_CFG"
-
-    echo "❌ No SSID found for public IP: $PUBLIC_IP" >&2
-
-    return 1
+    echo "$VALUE"
 }
 
 # =========================================================
@@ -355,12 +357,13 @@ detect_box() {
 curl_influx() {
 
     local LINE="$1"
-    local URL="http://${INFLUX_HOST}:8086/write?db=speedtest&u=monitor&p=${PASS}"
+
+    local URL
+    URL="http://${INFLUX_HOST}:8086/write?db=speedtest&u=monitor&p=${PASS}"
 
     echo "📡 Curl → influxdb:8086..."
 
     local ERR_FILE="/tmp/curl_err.$$"
-
     local HTTP_CODE
 
     HTTP_CODE=$(curl -s \
@@ -379,59 +382,70 @@ curl_influx() {
 
     rm -f "$ERR_FILE"
 
-    case $CURL_EXIT in
+    case "$CURL_EXIT" in
 
         0)
+
             if [[ "$HTTP_CODE" == "204" ]]; then
+
                 echo "✅ SUCCESS HTTP: $HTTP_CODE"
+
                 return 0
             fi
 
             echo "❌ HTTP ERROR: $HTTP_CODE"
-            echo "   Line: ${LINE:0:100}..."
+            echo "   Line: ${LINE:0:200}"
 
-            [[ -n "$CURL_ERR" ]] && echo "   Curl: $CURL_ERR"
+            [[ -n "$CURL_ERR" ]] &&
+                echo "   Curl: $CURL_ERR"
 
             return 1
             ;;
 
         6)
-            echo "❌ DNS ERROR: Cannot resolve influxdb → Check Docker networking"
+
+            echo "❌ DNS ERROR: Cannot resolve influxdb"
             return 1
             ;;
 
         7)
-            echo "❌ CONNECT ERROR: Cannot reach influxdb:8086 → Check Docker container"
+
+            echo "❌ CONNECT ERROR: Cannot reach influxdb:8086"
             return 1
             ;;
 
         28)
-            echo "❌ TIMEOUT: influxdb:8086 → Network issue"
+
+            echo "❌ TIMEOUT: influxdb:8086"
             return 1
             ;;
 
         *)
+
             echo "❌ CURL FAILED (exit $CURL_EXIT): $CURL_ERR"
             return 1
             ;;
+
     esac
 }
 
 # =========================================================
-# Send JSON result to InfluxDB
+# Send Speedtest result
 # =========================================================
 
 send() {
 
     local JSON="$1"
 
-    [[ -z "$JSON" ]] && {
+    if [[ -z "$JSON" ]]; then
+
         echo "❌ No JSON output"
+
         return 1
-    }
+    fi
 
     # -----------------------------------------------------
-    # Get public IP directly from Speedtest JSON
+    # Public IP
     # -----------------------------------------------------
 
     local PUBLIC_IP
@@ -448,7 +462,8 @@ send() {
 
     else
 
-        echo "❌ Unknown Speedtest type: $SPEEDTEST_TYPE"
+        echo "❌ Unknown Speedtest type"
+
         return 1
     fi
 
@@ -459,30 +474,51 @@ send() {
         return 1
     fi
 
+    # -----------------------------------------------------
+    # Determine SSID
+    # -----------------------------------------------------
+
+    local INTERFACE
     local BOX
 
-    BOX=$(detect_wifi_ssid)
+    INTERFACE=$(get_internet_interface) || {
 
-    if [[ -n "$BOX" ]]; then
+        echo "❌ Unable to determine Internet interface"
 
-        echo "📶 Using Wi-Fi SSID: $BOX"
+        return 1
+    }
+
+    if [[ "$INTERFACE" == "wlan0" ]]; then
+
+        BOX=$(detect_wifi_ssid "$INTERFACE") || {
+
+            echo "❌ Internet uses wlan0 but SSID could not be detected"
+
+            return 1
+        }
 
     else
 
-        echo "ℹ️ Wi-Fi SSID not detected, using DNS/IP detection..." >&2
+        # Ethernet is only possible if explicitly allowed
+        BOX=$(get_configured_test_interface)
 
-        BOX=$(detect_box "$PUBLIC_IP")
+        if [[ "$INTERFACE" != "$BOX" ]]; then
 
-        if [[ $? -ne 0 || -z "$BOX" ]]; then
-
-            echo "❌ No SSID found - speedtest result will NOT be sent"
+            echo "❌ Internet uses $INTERFACE but this interface is not allowed"
 
             return 1
         fi
+
+        # For Ethernet, use interface name as box unless an
+        # explicit mapping is added later.
+        BOX="$INTERFACE"
+
+        echo "⚠️ Ethernet speedtest: using interface name as box: $BOX"
     fi
 
     echo "🌐 Public IP: $PUBLIC_IP"
-    echo "📶 SSID: $BOX"
+    echo "🔌 Internet interface: $INTERFACE"
+    echo "📶 Box/SSID: $BOX"
 
     # -----------------------------------------------------
     # Parse Speedtest values
@@ -498,10 +534,10 @@ send() {
             jq -r '.ping.latency // 0')
 
         DL=$(echo "$JSON" |
-            jq -r '.download.bandwidth * 8 / 1000000 // 0')
+            jq -r '(.download.bandwidth // 0) * 8 / 1000000')
 
         UL=$(echo "$JSON" |
-            jq -r '.upload.bandwidth * 8 / 1000000 // 0')
+            jq -r '(.upload.bandwidth // 0) * 8 / 1000000')
 
     elif [[ "$SPEEDTEST_TYPE" == "speedtest-cli" ]]; then
 
@@ -509,10 +545,10 @@ send() {
             jq -r '.ping // 0')
 
         DL=$(echo "$JSON" |
-            jq -r '.download / 1000000 // 0')
+            jq -r '(.download // 0) / 1000000')
 
         UL=$(echo "$JSON" |
-            jq -r '.upload / 1000000 // 0')
+            jq -r '(.upload // 0) / 1000000')
 
     fi
 
@@ -526,40 +562,96 @@ send() {
     fi
 
     # -----------------------------------------------------
+    # Escape InfluxDB tags
+    # -----------------------------------------------------
+
+    local HOSTNAME_ESCAPED
+    local BOX_ESCAPED
+    local INTERFACE_ESCAPED
+
+    HOSTNAME_ESCAPED=$(escape_influx_tag "$HOSTNAME")
+    BOX_ESCAPED=$(escape_influx_tag "$BOX")
+    INTERFACE_ESCAPED=$(escape_influx_tag "$BOX")
+
+    # -----------------------------------------------------
+    # InfluxDB timestamp
+    # -----------------------------------------------------
+
+    local TS
+    TS=$(date +%s%N)
+
+    # -----------------------------------------------------
     # InfluxDB line protocol
+    #
+    # IMPORTANT:
+    #
+    # Tags:
+    #   host
+    #   box
+    #   interface
+    #
+    # Fields:
+    #   ping
+    #   download
+    #   upload
+    #
+    # There is intentionally NO comma before ping.
+    # The space separates tags from fields.
     # -----------------------------------------------------
 
     local LINE
 
-    #LINE="speedtest,host=${HOSTNAME},box=${BOX},interface=${BOX} ping=${PING},download=${DL},upload=${UL} ${TS}"
-	escape_influx_tag() {
-		local VALUE="$1"
-		VALUE="${VALUE//\\/\\\\}"
-		VALUE="${VALUE//,/\\,}"
-		VALUE="${VALUE// /\\ }"
-		VALUE="${VALUE//=/\\=}"
-		printf '%s' "$VALUE"
-	}
-	local HOSTNAME_ESCAPED
-	local BOX_ESCAPED
+    LINE="speedtest,host=${HOSTNAME_ESCAPED},box=${BOX_ESCAPED},interface=${INTERFACE_ESCAPED} ping=${PING},download=${DL},upload=${UL} ${TS}"
 
-	HOSTNAME_ESCAPED=$(escape_influx_tag "$HOSTNAME")
-	BOX_ESCAPED=$(escape_influx_tag "$BOX")
-
-local LINE="speedtest,host=${HOSTNAME_ESCAPED},box=${BOX_ESCAPED},interface=${BOX_ESCAPED} ping=${PING},download=${DL},upload=${UL} ${TS}"
     echo "📤 Sending: $LINE"
 
     curl_influx "$LINE"
 }
 
 # =========================================================
-# Main execution
+# Main
 # =========================================================
 
 echo "🚀 Speedtest from $HOSTNAME → influxdb"
 echo "🔧 Speedtest type: $SPEEDTEST_TYPE"
 
+# ---------------------------------------------------------
+# Determine Internet interface BEFORE running Speedtest
+# ---------------------------------------------------------
+
+check_internet_interface
+
+ROUTE_RESULT=$?
+
+if [[ "$ROUTE_RESULT" -eq 2 ]]; then
+
+    END_DATETIME=$(date '+%Y-%m-%d %H:%M:%S')
+    END_TS=$(date +%s)
+    DURATION=$((END_TS - START_TS))
+
+    echo "🛑 Speedtest skipped: Internet is not using Wi-Fi"
+    echo "🕐 End:   $END_DATETIME"
+    echo "⏱️ Duration: ${DURATION}s"
+
+    exit 0
+fi
+
+if [[ "$ROUTE_RESULT" -ne 0 ]]; then
+
+    echo "❌ Unable to determine whether speedtest is allowed"
+
+    exit 1
+fi
+
+# ---------------------------------------------------------
+# Run Speedtest
+# ---------------------------------------------------------
+
+local_json=""
+
 if [[ "$SPEEDTEST_TYPE" == "ookla" ]]; then
+
+    echo "🚀 Running Ookla speedtest..."
 
     LOCAL_JSON=$(speedtest \
         --accept-license \
@@ -568,27 +660,52 @@ if [[ "$SPEEDTEST_TYPE" == "ookla" ]]; then
 
 elif [[ "$SPEEDTEST_TYPE" == "speedtest-cli" ]]; then
 
+    echo "🚀 Running Debian speedtest-cli..."
+
     LOCAL_JSON=$(speedtest-cli \
         --json 2>/dev/null)
 
 else
 
     echo "❌ FATAL: Unsupported Speedtest type"
+
     exit 1
 fi
 
+# ---------------------------------------------------------
+# Check JSON
+# ---------------------------------------------------------
+
 if [[ -z "$LOCAL_JSON" ]]; then
 
-    echo "❌ Speedtest returned no JSON output"
+    echo "❌ No JSON output"
 
-    RESULT=1
+    END_DATETIME=$(date '+%Y-%m-%d %H:%M:%S')
+    END_TS=$(date +%s)
+    DURATION=$((END_TS - START_TS))
 
-else
+    echo "🕐 End:   $END_DATETIME"
+    echo "⏱️ Duration: ${DURATION}s"
+    echo "❌ Failed: $END_DATETIME"
 
-    send "$LOCAL_JSON"
-    RESULT=$?
-
+    exit 1
 fi
+
+# Optional validation
+if ! echo "$LOCAL_JSON" | jq -e . >/dev/null 2>&1; then
+
+    echo "❌ Speedtest returned invalid JSON"
+
+    exit 1
+fi
+
+# ---------------------------------------------------------
+# Send result
+# ---------------------------------------------------------
+
+send "$LOCAL_JSON"
+
+RESULT=$?
 
 # =========================================================
 # End datetime / execution duration
@@ -601,10 +718,14 @@ DURATION=$((END_TS - START_TS))
 echo "🕐 End:   $END_DATETIME"
 echo "⏱️ Duration: ${DURATION}s"
 
-if [[ $RESULT -eq 0 ]]; then
+if [[ "$RESULT" -eq 0 ]]; then
+
     echo "✅ Complete: $END_DATETIME"
+
 else
+
     echo "❌ Failed: $END_DATETIME"
+
 fi
 
-exit $RESULT
+exit "$RESULT"
