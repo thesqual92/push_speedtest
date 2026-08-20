@@ -37,6 +37,33 @@
 set -o pipefail
 
 # =========================================================
+# Command-line options
+# =========================================================
+
+NO_DATABASE_UPLOAD=false
+
+for ARG in "$@"; do
+    case "$ARG" in
+        --no-database-upload)
+            NO_DATABASE_UPLOAD=true
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--no-database-upload]"
+            echo
+            echo "Options:"
+            echo "  --no-database-upload   Run Speedtest without writing to InfluxDB"
+            echo "  -h, --help             Show this help"
+            exit 0
+            ;;
+        *)
+            echo "❌ Unknown argument: $ARG"
+            echo "Usage: $0 [--no-database-upload]"
+            exit 1
+            ;;
+    esac
+done
+
+# =========================================================
 # Start datetime / execution timer
 # =========================================================
 
@@ -551,11 +578,15 @@ curl_influx() {
 
     local LINE="$1"
 
-    local URL
-    URL="http://${INFLUX_HOST}:8086/write?db=speedtest&u=monitor&p=${PASS}"
+    if [[ "$NO_DATABASE_UPLOAD" == true ]]; then
+        echo "⏭️ Database upload disabled (--no-database-upload)"
+        echo "📤 Would send: $LINE"
+        return 0
+    fi
+
+    local URL="http://${INFLUX_HOST}:8086/write?db=speedtest&u=monitor&p=${PASS}"
 
     echo "📡 Curl → influxdb:8086..."
-
     local ERR_FILE="/tmp/curl_err.$$"
     local HTTP_CODE
 
@@ -779,6 +810,12 @@ send() {
 # =========================================================
 
 echo "🚀 Speedtest from $HOSTNAME → influxdb"
+
+if [[ "$NO_DATABASE_UPLOAD" == true ]]; then
+    echo "🧪 Database upload: DISABLED"
+else
+    echo "💾 Database upload: ENABLED"
+fi
 echo "🔧 Speedtest type: $SPEEDTEST_TYPE"
 
 # =========================================================
