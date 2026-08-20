@@ -261,13 +261,71 @@ get_interface_gateway() {
 get_wifi_ssid() {
 
     local INTERFACE="$1"
+    local IW=""
+    local SSID=""
 
-    if ! command -v iw >/dev/null 2>&1; then
-        return 1
+    # ---------------------------------------------------------
+    # Find iw explicitly
+    # Cron can have a different PATH from an interactive shell
+    # ---------------------------------------------------------
+
+    if [[ -x /usr/sbin/iw ]]; then
+        IW="/usr/sbin/iw"
+    elif [[ -x /usr/bin/iw ]]; then
+        IW="/usr/bin/iw"
+    elif command -v iw >/dev/null 2>&1; then
+        IW="$(command -v iw)"
     fi
 
-    iw dev "$INTERFACE" link 2>/dev/null |
-        awk -F': ' '/SSID:/ {print $2; exit}'
+    # ---------------------------------------------------------
+    # Method 1: iw
+    # ---------------------------------------------------------
+
+    if [[ -n "$IW" ]]; then
+
+        SSID=$("$IW" dev "$INTERFACE" link 2>/dev/null |
+            awk -F': ' '/^[[:space:]]*SSID:/ {
+                print $2
+                exit
+            }')
+
+        if [[ -n "$SSID" ]]; then
+            printf '%s\n' "$SSID"
+            return 0
+        fi
+    fi
+
+    # ---------------------------------------------------------
+    # Method 2: NetworkManager
+    # ---------------------------------------------------------
+
+    if [[ -x /usr/bin/nmcli ]]; then
+
+        SSID=$(
+            /usr/bin/nmcli -t -f GENERAL.CONNECTION device show "$INTERFACE" \
+                2>/dev/null |
+            sed 's/^GENERAL.CONNECTION://'
+        )
+
+        if [[ -n "$SSID" && "$SSID" != "--" ]]; then
+            printf '%s\n' "$SSID"
+            return 0
+        fi
+    fi
+
+    # ---------------------------------------------------------
+    # Nothing worked
+    # ---------------------------------------------------------
+
+    echo "⚠️ Unable to determine SSID for $INTERFACE" >&2
+
+    if [[ -z "$IW" ]]; then
+        echo "⚠️ iw command not found" >&2
+    else
+        echo "⚠️ iw used: $IW" >&2
+    fi
+
+    return 1
 }
 
 # =========================================================
