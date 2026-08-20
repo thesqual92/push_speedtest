@@ -469,7 +469,11 @@ The InfluxDB password is stored separately:
 /etc/speedtest/influxdb_pass
 ```
 
----
+Add the script to crontab (root)
+
+```text
+*/5 * * * * /opt/speedtest-stack/scripts/push_speedtest.sh >> /var/log/speedtest_cron.log 2>&1
+```
 
 ## License
 
